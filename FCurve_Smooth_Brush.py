@@ -5,8 +5,7 @@ bl_info = {
     "blender": (3, 6, 0),
     "location": "Graph Editor > Sidebar > Tool",
     "description": "Paint to smooth FCurves in the Graph Editor",
-    "warning": "",
-    "doc_url": "",
+    "doc_url": "https://github.com/evilmushroom/FCurve_Smooth_Brush",
     "category": "Animation",
 }
 
