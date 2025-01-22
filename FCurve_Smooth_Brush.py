@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FCurve Smooth Brush",
     "author": "Evilmushroom/Claude",
-    "version": (1, 5),
+    "version": (1, 6),
     "blender": (3, 6, 0),
     "location": "Graph Editor > Sidebar > Tool",
     "description": "Paint to smooth FCurves in the Graph Editor",
@@ -95,14 +95,16 @@ class FCurveSmoothBrushProperties(bpy.types.PropertyGroup):
         description="Size of the brush",
         default=50.0,
         min=1.0,
-        max=500.0
+        max=500.0,
+        subtype='FACTOR'  # Makes it display as a slider
     )
     strength: FloatProperty(
         name="Strength",
         description="Strength of the brush effect",
         default=0.5,
         min=0.0,
-        max=1.0
+        max=1.0,
+        subtype='FACTOR'  # Makes it display as a slider
     )
     iterations: IntProperty(
         name="Iterations",
@@ -110,16 +112,6 @@ class FCurveSmoothBrushProperties(bpy.types.PropertyGroup):
         default=1,
         min=1,
         max=10
-    )
-    falloff_type: EnumProperty(
-        name="Falloff Type",
-        description="Type of brush falloff",
-        items=[
-            ('CONSTANT', "Constant", "No falloff"),
-            ('LINEAR', "Linear", "Linear falloff"),
-            ('SMOOTH', "Smooth", "Smooth falloff"),
-        ],
-        default='SMOOTH'
     )
     brush_mode: EnumProperty(
         name="Brush Mode",
@@ -133,19 +125,6 @@ class FCurveSmoothBrushProperties(bpy.types.PropertyGroup):
         ],
         default='SMOOTH'
     )
-    use_mirror: BoolProperty(
-        name="Use Mirror",
-        description="Apply changes symmetrically",
-        default=False
-    )
-    mirror_axis: EnumProperty(
-        name="Mirror Axis",
-        items=[
-            ('TIME', "Time", "Mirror across time"),
-            ('VALUE', "Value", "Mirror across value")
-        ],
-        default='TIME'
-    )
     affect_selected: BoolProperty(
         name="Selected Only",
         description="Only affect selected keyframes",
@@ -155,16 +134,6 @@ class FCurveSmoothBrushProperties(bpy.types.PropertyGroup):
         name="Select While Painting",
         description="Auto-select keyframes under brush",
         default=False
-    )
-    use_pressure: BoolProperty(
-        name="Use Pressure",
-        description="Use tablet pressure for strength",
-        default=True
-    )
-    show_affected: BoolProperty(
-        name="Show Affected",
-        description="Show affected keyframes preview",
-        default=True
     )
     use_acceleration: BoolProperty(
         name="Use Acceleration",
@@ -301,6 +270,18 @@ class FCurveSmoothBrushOperator(bpy.types.Operator):
             context.window.cursor_set('DEFAULT')
             return {'PASS_THROUGH'}
             
+        # Handle ESC to properly deactivate the addon
+        if event.type == 'ESC':
+            self.cleanup_handlers()
+            context.window.cursor_set('DEFAULT')
+            context.scene.fcurve_smooth_brush.is_active = False  # Properly deactivate the addon
+            return {'CANCELLED'}
+        
+        if not context.scene.fcurve_smooth_brush.is_active:
+            self.cleanup_handlers()
+            context.window.cursor_set('DEFAULT')
+            return {'CANCELLED'}
+        
         # Handle custom undo/redo
         if event.type in {'Z', 'Y'} and event.ctrl:
             if len(self.undo_states) > 1:  # Need at least 2 states for undo
@@ -351,11 +332,6 @@ class FCurveSmoothBrushOperator(bpy.types.Operator):
                     self.is_painting = False
                     self.end_stroke(context)  # End stroke properly
         
-        if not context.scene.fcurve_smooth_brush.is_active or event.type == 'ESC':
-            self.cleanup_handlers()
-            context.window.cursor_set('DEFAULT')
-            return {'CANCELLED'}
-            
         return {'RUNNING_MODAL'}
     
     def invoke(self, context, event):
@@ -528,85 +504,68 @@ class FCurveSmoothBrushOperator(bpy.types.Operator):
         return keyframe.co[1]
 
     def smooth_curves(self, context):
+        """Main function to process and smooth the curves under the brush"""
         if not self.active_stroke:
-            self.begin_stroke()  # Ensure we have initial values
-            
+            self.begin_stroke()
+        
         # Cache commonly accessed properties
         props = context.scene.fcurve_smooth_brush
         brush_size = props.brush_size
         strength = props.strength
         mode = props.brush_mode
-        use_mirror = props.use_mirror
-        mirror_axis = props.mirror_axis
         
-        # Pre-calculate view transformation once
+        # Get mouse position in view space
         region = context.region
         view = region.view2d
         mouse_frame, mouse_value = view.region_to_view(self.mouse_pos.x, self.mouse_pos.y)
         
-        # Pre-calculate falloff lookup
-        if props.falloff_type == 'SMOOTH':
-            def get_factor(distance): return (1 - distance ** 2)
-        elif props.falloff_type == 'LINEAR':
-            def get_factor(distance): return (1 - distance)
-        else:
-            def get_factor(distance): return 1.0 if distance < 0.8 else 0.0
-        
-        if props.use_pressure and context.window_manager.get("pen_pressure"):
-            strength *= context.window_manager.pen_pressure
-        
+        # Process each selected curve
         for fcurve in context.selected_editable_fcurves:
-            if not fcurve.hide:
-                # Quick bounds check before processing keyframes
-                frame_min = min(k.co[0] for k in fcurve.keyframe_points)
-                frame_max = max(k.co[0] for k in fcurve.keyframe_points)
+            if fcurve.hide:
+                continue
+            
+            # Quick bounds check
+            frame_min = min(k.co[0] for k in fcurve.keyframe_points)
+            frame_max = max(k.co[0] for k in fcurve.keyframe_points)
+            
+            if abs(mouse_frame - frame_min) > brush_size and abs(mouse_frame - frame_max) > brush_size:
+                continue  # Skip if curve is far from brush
+            
+            # Get keyframes to process
+            all_keyframes = list(fcurve.keyframe_points)
+            if props.use_acceleration:
+                sample_rate = max(1, int(props.sample_rate))
+                keyframes = all_keyframes[::sample_rate]
+            else:
+                keyframes = all_keyframes
+            
+            if props.affect_selected:
+                keyframes = [k for k in keyframes if k.select_control_point]
+            
+            # Process each keyframe
+            for keyframe in keyframes:
+                # Convert to screen space for distance check
+                screen_x, screen_y = view.view_to_region(keyframe.co[0], keyframe.co[1])
+                mouse_screen_x = self.mouse_pos.x
+                mouse_screen_y = self.mouse_pos.y
                 
-                if abs(mouse_frame - frame_min) > brush_size and abs(mouse_frame - frame_max) > brush_size:
-                    continue  # Skip this fcurve entirely
+                # Calculate distance and factor
+                dx = screen_x - mouse_screen_x
+                dy = screen_y - mouse_screen_y
+                distance = ((dx * dx + dy * dy) ** 0.5) / brush_size
                 
-                all_keyframes = list(fcurve.keyframe_points)
-                if props.use_acceleration:
-                    sample_rate = max(1, int(props.sample_rate))
-                    keyframes = all_keyframes[::sample_rate]
-                else:
-                    keyframes = all_keyframes
+                if distance <= 1.0:
+                    # Smooth falloff
+                    factor = (1 - distance ** 2) * strength
                     
-                if props.affect_selected:
-                    keyframes = [k for k in keyframes if k.select_control_point]
-                
-                for keyframe in keyframes:
-                    # Convert keyframe position to screen space
-                    screen_x, screen_y = view.view_to_region(keyframe.co[0], keyframe.co[1])
-                    mouse_screen_x = self.mouse_pos.x
-                    mouse_screen_y = self.mouse_pos.y
+                    # Apply the brush effect
+                    new_value = self.process_stroke(context, keyframe, factor, mode, fcurve)
+                    keyframe.co[1] = new_value
                     
-                    # Calculate distance in screen space
-                    dx = screen_x - mouse_screen_x
-                    dy = screen_y - mouse_screen_y
-                    distance = ((dx * dx + dy * dy) ** 0.5) / brush_size
-                    
-                    if distance <= 1.0:
-                        factor = get_factor(distance)
-                        factor *= strength
-                        
-                        # Pass fcurve to process_stroke for relative mode
-                        new_value = self.process_stroke(context, keyframe, factor, mode, fcurve)
-                        keyframe.co[1] = new_value
-                        
-                        if use_mirror:
-                            if mirror_axis == 'TIME':
-                                mirror_frame = mouse_frame - (keyframe.co[0] - mouse_frame)
-                                mirror_keyframes = [k for k in keyframes if abs(k.co[0] - mirror_frame) < 0.1]
-                                for mk in mirror_keyframes:
-                                    mk.co[1] = new_value
-                            else:  # VALUE
-                                mirror_value = mouse_value - (keyframe.co[1] - mouse_value)
-                                keyframe.co[1] = mirror_value
-                        
-                        if props.select_while_painting:
-                            keyframe.select_control_point = True
-                
-                fcurve.update()
+                    if props.select_while_painting:
+                        keyframe.select_control_point = True
+            
+            fcurve.update()
         
         if props.auto_frame:
             bpy.ops.graph.view_selected()
@@ -690,22 +649,12 @@ class FCurveSmoothBrushPanel(bpy.types.Panel):
             row.label(text="Brush Active", icon='RADIOBUT_ON')
             row.prop(props, "is_active", text="", icon='X')
         
-        # Brush mode
-        layout.prop(props, "brush_mode", text="Mode")
-        
-        # Basic settings
+        # Brush settings
         col = layout.column(align=True)
+        col.prop(props, "brush_mode", text="Mode")
         col.prop(props, "brush_size", text="Size")
         col.prop(props, "strength", text="Strength")
         col.prop(props, "iterations", text="Iterations")
-        col.prop(props, "falloff_type", text="Falloff")
-        
-        # Mirror options
-        box = layout.box()
-        row = box.row()
-        row.prop(props, "use_mirror", text="Mirror")
-        if props.use_mirror:
-            row.prop(props, "mirror_axis", text="")
         
         # Selection options
         box = layout.box()
@@ -717,8 +666,6 @@ class FCurveSmoothBrushPanel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Advanced")
         col = box.column()
-        col.prop(props, "use_pressure", text="Tablet Pressure")
-        col.prop(props, "show_affected", text="Show Preview")
         col.prop(props, "use_acceleration", text="Use Acceleration")
         if props.use_acceleration:
             col.prop(props, "sample_rate", text="Sample Rate")
