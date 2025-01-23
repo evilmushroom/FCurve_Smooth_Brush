@@ -56,7 +56,7 @@ Contributions are welcome! Feel free to submit issues, feature requests, or pull
 
 ## License
 
-This project is licensed under the MIT License.
+This addon is licensed under the GNU General Public License v3.
 
 ---
 
